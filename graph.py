@@ -20,7 +20,9 @@ import logging
 from logging.handlers import RotatingFileHandler
 import time
 import functools
-
+import requests
+from exa_py import Exa
+import os
 # ---------------- LOGGING SETUP ---------------- #
 
 file_handler = RotatingFileHandler(
@@ -78,8 +80,8 @@ def log_call(level=logging.INFO):
 
 load_dotenv()
 
-NUM_MSG_TO_KEEP = 5
-MAX_TOKENS = 1000
+NUM_MSG_TO_KEEP = 10
+MAX_TOKENS = 10000
 buffer_lock = asyncio.Lock()
 encoding = tiktoken.encoding_for_model("gpt-4o-mini")
 BACKGROUND_TASKS = set()
@@ -93,7 +95,6 @@ EventType = Literal[
     "important_events",
     "other",
 ]
-
 
 class State(TypedDict):
     user_id: str
@@ -121,7 +122,7 @@ class MemoryExtraction(BaseModel):
 SUMMARY_BUFFER: dict[str, State] = {}
 USER_PROFILES: dict[str, list] = {}
 
-def last_message_of_type(messages, msg_type):
+def last_message_of_type(messages:List[BaseMessage], msg_type:BaseMessage)->BaseMessage|None:
     try:
         return next((m for m in reversed(messages) if isinstance(m, msg_type)), None)
     except Exception as e:
@@ -137,12 +138,14 @@ def messages_to_text(messages: List[BaseMessage]) -> str:
             text = f"{type(m).__name__}: {m.content}"
             
             # Handle Tool Calls (The missing piece)
-            if isinstance(m, AIMessage) and m.tool_calls:
-                tools_desc = ", ".join(
-                    f"{t['name']}({t['args']})" for t in m.tool_calls
-                )
-                text += f" [Tool Calls: {tools_desc}]"
-                
+            try:
+                if isinstance(m, AIMessage) and m.tool_calls:
+                    tools_desc = ", ".join(
+                        f"{t['name']}({t['args']})" for t in m.tool_calls
+                    )
+                    text += f" [Tool Calls: {tools_desc}]"
+            except Exception as e:
+                logger.error(f"Message is not a BaseMessage {e}")  
             lines.append(text)
         return "\n".join(lines)
     except Exception as e:
@@ -210,10 +213,43 @@ async def periodic_memory_dump():
         except Exception as e:
             logger.error(f"Error in periodic_memory_dump: {e}", exc_info=True)
 
+async def memory_extractor(message:str,user_id:str):
+    """Extract memories from the last user message"""
+    try:
+        # bind llm with structured output
+        llm_for_memory = llm.with_structured_output(MemoryExtraction)
 
+        if not message:
+            return 
+
+        response = await llm_for_memory.ainvoke(
+            [
+                SystemMessage(content=system_prompts["memory_extraction_prompt"]),
+                HumanMessage(content=message),
+            ]
+        )
+
+        if not response or not response.items:
+            return
+        for item in response.items:
+            try:
+                if item.store and item.message and item.message.strip():
+                    async with buffer_lock:
+                        USER_PROFILES.setdefault(user_id, []).append(
+                            {
+                                "event_type": item.event_type or "other",
+                                "message": item.message,
+                            }
+                        )
+            except Exception as e:
+                logger.warning(f"Failed to buffer memory item: {item}", exc_info=True)
+                continue
+    except Exception as e:
+        logger.error(f"Error in memory_extractor : {e}", exc_info=True)
+
+#---------------------------Summary----------------------------------#
 async def summarize_memory(snapshot: State):
     """Summarizes messages to reduce memory bloat and cost"""
-    logger.log("summarizing\n")
     try:
         if not snapshot:
             return
@@ -251,15 +287,14 @@ async def summarize_memory(snapshot: State):
             SUMMARY_BUFFER[new_state["user_id"]] = new_state
     except Exception as e:
         logger.error(f"Error in summarize_memory: {e}", exc_info=True)
-
-# ---------------- TOOLS ---------------- #
-
+    
+# ---------------- TOOLS ----------------#
 
 @log_call()
 def make_fetch_user_profile(user_id: str):
     @tool
     def fetch_user_profile(query: str) -> List[dict]:
-        """Fetches user profile information from memory based on a query"""
+        """Fetches user profile information from memory based on a query, TAKES ONLY ONE ARGUMENT query:str"""
         try:
             if not query:
                 return []
@@ -270,7 +305,6 @@ def make_fetch_user_profile(user_id: str):
 
     return fetch_user_profile
 
-
 @tool
 def num_tokens(message: str) -> int:
     """Returns the number of tokens in a message"""
@@ -279,7 +313,6 @@ def num_tokens(message: str) -> int:
     except Exception as e:
         logger.error(f"Error in num_tokens: {e}", exc_info=True)
         return 0
-
 
 @tool
 async def summarize_text(text: str, max_words: int = 150) -> str:
@@ -298,7 +331,63 @@ async def summarize_text(text: str, max_words: int = 150) -> str:
         logger.error(f"Error in summarize_text: {e}", exc_info=True)
         return "Summary unavailable"
 
+@tool
+async def get_weather(city: str) -> str:
+    """Fetch the current weather of a city"""
 
+    try:
+        url = f"https://wttr.in/{city}?format=%t+%f+%h"
+
+        def fetch():
+            return requests.get(url, timeout=10).text.strip()
+
+        weather = await asyncio.to_thread(fetch)
+
+        return f"actual temperature, feels like, humidity: {weather}"
+
+    except Exception:
+        logger.exception("Error fetching the weather")
+        return "Error fetching the weather"
+
+@tool
+async def web_search(query: str) -> str:
+    """Search the web and return summarized results"""
+
+    api_key = os.getenv("EXA_API_KEY")
+    if not api_key:
+        return "Web search unavailable: missing EXA_API_KEY"
+
+    def _search():
+        exa = Exa(api_key=api_key)
+        return exa.search_and_contents(
+            query=query,
+            num_results=3,
+            text=True,
+        )
+
+    try:
+        search_response = await asyncio.to_thread(_search)
+
+        if not search_response.results:
+            return "No relevant web results found."
+
+        parsed_results = ""
+        for i, result in enumerate(search_response.results, 1):
+            parsed_results += (
+                f"\n[SOURCE {i}]\n"
+                f"TITLE: {result.title}\n"
+                f"URL: {result.url}\n"
+                f"CONTENT:\n{result.text[:1000]}...\n"
+            )
+
+        return parsed_results
+
+    except Exception:
+        logger.exception("Error occurred during web_search")
+        return "Web search failed due to an internal error."
+
+
+Tools = [num_tokens,summarize_text,get_weather,web_search]
 # ---------------- GRAPH NODES ---------------- #
 
 
@@ -306,7 +395,7 @@ async def summarize_text(text: str, max_words: int = 150) -> str:
 async def chat_node(state: State):
     try:
         # create tool instances with bound user_id
-        tools = [make_fetch_user_profile(state["user_id"]), num_tokens, summarize_text]
+        tools=Tools+[make_fetch_user_profile(user_id= state["user_id"]),]
         TOOL_REGISTRY = {t.name: t for t in tools}
 
         # bind tools to llm
@@ -339,10 +428,7 @@ async def chat_node(state: State):
                         )
                         continue
 
-                    if asyncio.iscoroutinefunction(tool.func):
-                        result = await tool.func(**tool_call["args"])
-                    else:
-                        result = tool.func(**tool_call["args"])
+                    result = await tool.ainvoke(tool_call["args"])
 
                     messages.append(
                         ToolMessage(
@@ -368,36 +454,12 @@ async def chat_node(state: State):
 async def memory_extract_node(state: State):
     """Extract memories from the last user message"""
     try:
-        # bind llm with structured output
-        llm_for_memory = llm.with_structured_output(MemoryExtraction)
-
-        last_user = last_message_of_type(state["messages"], HumanMessage)
-        if not last_user:
-            return {}
-
-        response = await llm_for_memory.ainvoke(
-            [
-                SystemMessage(content=system_prompts["memory_extraction_prompt"]),
-                HumanMessage(content=last_user.content),
-            ]
-        )
-
-        if not response or not response.items:
-            return {}
-
-        for item in response.items:
-            try:
-                if item.store and item.message and item.message.strip():
-                    async with buffer_lock:
-                        USER_PROFILES.setdefault(state["user_id"], []).append(
-                            {
-                                "event_type": item.event_type or "other",
-                                "message": item.message,
-                            }
-                        )
-            except Exception as e:
-                logger.warning(f"Failed to buffer memory item: {item}", exc_info=True)
-                continue
+        last_user_msg = last_message_of_type(state["messages"],HumanMessage).content
+        if last_user_msg:
+            last_user_msg = last_user_msg if isinstance(last_user_msg,str) else str(last_user_msg)
+            task = asyncio.create_task(memory_extractor(last_user_msg,state["user_id"]))
+            BACKGROUND_TASKS.add(task)
+            task.add_done_callback(BACKGROUND_TASKS.discard)
 
         return {}
     except Exception as e:
@@ -407,11 +469,22 @@ async def memory_extract_node(state: State):
 @log_call()
 async def add_summary(state: State):
     # Schedule summarization (only once)
-    if not state.get("summarizing") and state.get("total_tokens", 0) >= 1000:
+    if not state.get("summarizing") and state.get("total_tokens", 0) >= MAX_TOKENS:
         try:
+            new_messages = []
+            for msg in state["messages"]:
+                if isinstance(msg, ToolMessage):
+                    new_messages.append(
+                        ToolMessage(
+                            content=msg.content,
+                            tool_call_id=msg.tool_call_id,
+                        )
+                    )
+                else:
+                    new_messages.append(type(msg)(content=msg.content))
             snapshot = {
                 "user_id": state["user_id"],
-                "messages": list(state["messages"]),
+                "messages":new_messages,
                 "total_tokens": state["total_tokens"],
                 "turn": state["turn"],
                 "total_msg": state["total_msg"],
