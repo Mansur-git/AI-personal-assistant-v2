@@ -1,4 +1,4 @@
-from typing import TypedDict, List, Literal
+from typing import TypedDict, List, Literal,Optional
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END, START
 from langchain_core.messages import (
@@ -7,7 +7,9 @@ from langchain_core.messages import (
     HumanMessage,
     AIMessage,
     ToolMessage,
+    messages_to_dict,
 )
+from langgraph.graph.message import add_messages
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from mem_config import memory
@@ -17,12 +19,19 @@ import tiktoken
 import asyncio
 import json
 import logging
+import operator
 from logging.handlers import RotatingFileHandler
-import time
 import functools
 import requests
 from exa_py import Exa
 import os
+import time
+from bson import ObjectId
+from datetime import datetime,timezone
+from mongo import(
+    Messages,
+    Tasks
+)
 # ---------------- LOGGING SETUP ---------------- #
 
 file_handler = RotatingFileHandler(
@@ -98,6 +107,7 @@ EventType = Literal[
 
 class State(TypedDict):
     user_id: str
+    thread_id:str
     messages: List[BaseMessage]
     turn: int
     total_tokens: int
@@ -129,29 +139,6 @@ def last_message_of_type(messages:List[BaseMessage], msg_type:BaseMessage)->Base
         logger.error(f"Error in last_message_of_type: {e}", exc_info=True)
         return None
 
-def messages_to_text(messages: List[BaseMessage]) -> str:
-    """Converts a list of messages to a plain text representation, including tool calls."""
-    try:
-        lines = []
-        for m in messages:
-            # Handle standard content
-            text = f"{type(m).__name__}: {m.content}"
-            
-            # Handle Tool Calls (The missing piece)
-            try:
-                if isinstance(m, AIMessage) and m.tool_calls:
-                    tools_desc = ", ".join(
-                        f"{t['name']}({t['args']})" for t in m.tool_calls
-                    )
-                    text += f" [Tool Calls: {tools_desc}]"
-            except Exception as e:
-                logger.error(f"Message is not a BaseMessage {e}")  
-            lines.append(text)
-        return "\n".join(lines)
-    except Exception as e:
-        logger.error(f"Error in messages_to_text: {e}", exc_info=True)
-        return ""
-
 def count_tokens(message: str) -> int:
     """Direct token counting without tool wrapper"""
     try:
@@ -160,7 +147,11 @@ def count_tokens(message: str) -> int:
         logger.error(f"Error in count_tokens: {e}", exc_info=True)
         return 0
 
-
+# Helper to prevent crashes when dumping MongoDB data
+def mongo_serializer(o):
+    if isinstance(o, (datetime, ObjectId)):
+        return str(o)
+    raise TypeError(f"Type {type(o)} not serializable")
 # ---------------- LLM SETUP ---------------- #
 
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
@@ -246,8 +237,146 @@ async def memory_extractor(message:str,user_id:str):
                 continue
     except Exception as e:
         logger.error(f"Error in memory_extractor : {e}", exc_info=True)
+#---------------------------DB FUNCTIONS----------------------------#
+def make_create_new_task(user_id:str):
+    @tool
+    async def create_new_task(title:str,description:str,scheduled_for:datetime):
+        """Creates a new task and adds it to the database takes title,description and scheduled_for a datetime object"""
+        try:
+            return  Tasks.create_task(user_id=user_id,title=title,description=description,scheduled_for=scheduled_for)
+        except Exception as e:
+            logger.error(f"Error occured while creating a task {e}",exc_info=True)
+            return "Error occured while creating the task"
+    return create_new_task
+    
+def make_get_task(user_id: str):
+    @tool
+    async def get_specific_task(task_id:Optional[str]=None,title:Optional[str]=None):
+        """Retrieves a specific task by its unique ID."""
+        try:
+            if task_id:
+                return Tasks.get_task(user_id=user_id, task_id=task_id)
+            else:
+                return Tasks.get_task(user_id=user_id,title=title)
+        except Exception as e:
+            logger.error(f"Error occurred while retrieving task {task_id}: {e}", exc_info=True)
+            return f"Error occurred while retrieving the task: {str(e)}"
+    return get_specific_task
 
-#---------------------------Summary----------------------------------#
+def make_get_user_tasks(user_id: str):
+    @tool
+    async def list_all_tasks():
+        """Retrieves all tasks associated with the current user."""
+        try:
+            return Tasks.get_user_tasks(user_id=user_id)
+        except Exception as e:
+            logger.error(f"Error occurred while retrieving user tasks: {e}", exc_info=True)
+            return "Error occurred while retrieving your tasks"
+    return list_all_tasks
+
+def make_get_pending_tasks(user_id: str):
+    @tool
+    async def list_pending_tasks():
+        """Retrieves a list of tasks that are not yet marked as complete."""
+        try:
+            return Tasks.get_pending_tasks(user_id=user_id)
+        except Exception as e:
+            logger.error(f"Error occurred while retrieving pending tasks: {e}", exc_info=True)
+            return "Error occurred while retrieving pending tasks"
+    return list_pending_tasks
+
+def make_get_completed_tasks(user_id: str):
+    @tool
+    async def list_completed_tasks():
+        """Retrieves a list of tasks that have been marked as complete."""
+        try:
+            return Tasks.get_completed_tasks(user_id=user_id)
+        except Exception as e:
+            logger.error(f"Error occurred while retrieving completed tasks: {e}", exc_info=True)
+            return "Error occurred while retrieving completed tasks"
+    return list_completed_tasks
+
+def make_delete_task(user_id: str):
+    @tool
+    async def delete_existing_task(task_id: str):
+        """Permanently removes a task from the database using its ID."""
+        try:
+            return Tasks.delete_task(user_id=user_id, task_id=task_id)
+        except Exception as e:
+            logger.error(f"Error occurred while deleting task {task_id}: {e}", exc_info=True)
+            return f"Error occurred while deleting the task: {str(e)}"
+    return delete_existing_task
+
+def make_update_task(user_id: str):
+    @tool
+    async def update_existing_task(
+        task_id: str, 
+        title: Optional[str] = None, 
+        description: Optional[str] = None, 
+        scheduled_for: Optional[datetime] = None
+    ):
+        """
+        Updates details of an existing task. 
+        Provide only the fields that need to be changed (title, description, or scheduled_for).
+        """
+        try:
+            return Tasks.update_task(
+                user_id=user_id, 
+                task_id=task_id, 
+                title=title, 
+                description=description, 
+                scheduled_for=scheduled_for
+            )
+        except Exception as e:
+            logger.error(f"Error occurred while updating task {task_id}: {e}", exc_info=True)
+            return f"Error occurred while updating the task: {str(e)}"
+    return update_existing_task
+
+def make_complete_task(user_id: str):
+    @tool
+    async def mark_task_as_done(task_id: str):
+        """Marks a specific task as completed."""
+        try:
+            return Tasks.complete_task(user_id=user_id, task_id=task_id)
+        except Exception as e:
+            logger.error(f"Error occurred while completing task {task_id}: {e}", exc_info=True)
+            return f"Error occurred while completing the task: {str(e)}"
+    return mark_task_as_done
+
+def make_get_overdue_tasks(user_id: str):
+    @tool
+    async def list_overdue_tasks():
+        """Retrieves tasks that are pending and past their scheduled date."""
+        try:
+            return Tasks.get_overdue_tasks(user_id=user_id)
+        except Exception as e:
+            logger.error(f"Error occurred while retrieving overdue tasks: {e}", exc_info=True)
+            return "Error occurred while retrieving overdue tasks"
+    return list_overdue_tasks
+
+def make_get_tasks_by_date_range(user_id: str):
+    @tool
+    async def list_tasks_in_range(start_date: datetime, end_date: datetime):
+        """Retrieves tasks scheduled between a specific start and end datetime."""
+        try:
+            return Tasks.get_tasks_by_date_range(user_id=user_id, start_date=start_date, end_date=end_date)
+        except Exception as e:
+            logger.error(f"Error occurred while retrieving tasks by range: {e}", exc_info=True)
+            return "Error occurred while retrieving tasks for the specified date range"
+    return list_tasks_in_range
+#------------------------MESSAGES--------------------------#
+
+def make_add_messages(thread_id: str):
+    async def save_chat_message(messages:List[BaseMessage]):
+        """Saves a chat message to the database history."""
+        try:
+            return await Messages.add_messages(thread_id=thread_id,messages=messages)
+        except Exception as e:
+            logger.error(f"Error occurred while adding message: {e}", exc_info=True)
+            return "Error occurred while saving message"
+    return save_chat_message
+
+#---------------------------SUMMARY----------------------------------#
 async def summarize_memory(snapshot: State):
     """Summarizes messages to reduce memory bloat and cost"""
     try:
@@ -260,7 +389,7 @@ async def summarize_memory(snapshot: State):
             return
 
         sys_prompt = snapshot["messages"][0]
-        old_messages_text = messages_to_text(snapshot["messages"][1:-NUM_MSG_TO_KEEP])
+        old_messages_text = "\n".join(f"{m.type.upper()}: {m.content}" for m in snapshot["messages"][1:-NUM_MSG_TO_KEEP] if m.content)
         summary = await llm.ainvoke(
             [
                 SystemMessage(content=system_prompts["summarization_prompt"]),
@@ -271,26 +400,20 @@ async def summarize_memory(snapshot: State):
             [sys_prompt, AIMessage(content=str(summary.content))]
             + snapshot["messages"][-NUM_MSG_TO_KEEP:]
         )
-        new_state = {
-            "user_id": snapshot["user_id"],
-            "messages": new_messages,
-            "total_tokens": count_tokens(messages_to_text(new_messages)),
-            "turn": snapshot["turn"],
-            "total_msg": len(new_messages),
-            "model": snapshot["model"],
-            "job": snapshot["job"],
-            "summarized_at_msg": snapshot["total_msg"],
-            "summarizing": False
-        }
+        new_state = snapshot.copy()
+        new_state["messages"] = new_messages
+        new_state["summarizing"] = False
+        new_state["total_msg"] = len(new_state["messages"])
+        new_state["total_tokens"] = count_tokens(str(new_messages))
         # Store in summary buffer
         async with buffer_lock:
             SUMMARY_BUFFER[new_state["user_id"]] = new_state
     except Exception as e:
         logger.error(f"Error in summarize_memory: {e}", exc_info=True)
     
-# ---------------- TOOLS ----------------#
+# ----------------LLM TOOLS ----------------#
 
-@log_call()
+
 def make_fetch_user_profile(user_id: str):
     @tool
     def fetch_user_profile(query: str) -> List[dict]:
@@ -388,85 +511,164 @@ async def web_search(query: str) -> str:
 
 
 Tools = [num_tokens,summarize_text,get_weather,web_search]
+make_tools = [  make_complete_task,
+                make_create_new_task,
+                make_delete_task,
+                make_fetch_user_profile,
+                make_get_completed_tasks,
+                make_get_overdue_tasks,
+                make_get_pending_tasks,
+                make_update_task,
+                make_get_user_tasks,
+                make_get_tasks_by_date_range,
+                make_get_task
+            ]
+
 # ---------------- GRAPH NODES ---------------- #
 
-
-@log_call()
-async def chat_node(state: State):
+async def start_node(state:State):
+    available_roles = ["regular"]
     try:
-        # create tool instances with bound user_id
-        tools=Tools+[make_fetch_user_profile(user_id= state["user_id"]),]
-        TOOL_REGISTRY = {t.name: t for t in tools}
+        user_query = input("\nYou>")
+        job = await llm.ainvoke([
+            SystemMessage(
+                content=f"""You are a router based on the user query you have to select one job role from the following 
+                {available_roles}
+                ###RULES:
+                - Reply in ONW WORD ONLY 
+                - Your reply must be one of the job roles from the provided list of job roles
+                - DO NOT Try to resolve the user query just match the job role according to the user query
+                - If you don't understand what job role to chose just select 'regular' 
+                """
+            ),
+            HumanMessage(content=user_query)
+        ])
+        temp = job.content.strip()
+        job = temp if temp in available_roles else 'regular'
+        model = 'gpt-4o-mini' if job == 'regular' else 'gpt-4o'
 
-        # bind tools to llm
-        llm_with_tools = llm.bind_tools(tools)
-        messages = list(state["messages"])
-        # for tool in tools:
-        #     logger.info(f"Tool name: {tool.name}")
-        #     logger.info(f"Tool description: {tool.description}")
-        #     logger.info(f"Tool args schema: {tool.args_schema.schema() if hasattr(tool, 'args_schema') else 'No schema'}")
-        
-        while True:
-            response = await llm_with_tools.ainvoke(messages)
-
-            if not response.tool_calls:
-                print(f"\nYaara: {response.content}\n")
-                messages.append(response)
-                break
-
-            messages.append(response)
-
-            for tool_call in response.tool_calls:
-                try:
-                    tool = TOOL_REGISTRY.get(tool_call["name"])
-                    if not tool:
-                        messages.append(
-                            ToolMessage(
-                                tool_call_id=tool_call["id"],
-                                content="Unknown tool requested",
-                            )
-                        )
-                        continue
-
-                    result = await tool.ainvoke(tool_call["args"])
-
-                    messages.append(
-                        ToolMessage(
-                            tool_call_id=tool_call["id"],
-                            content=json.dumps(result)
-                            if not isinstance(result, str)
-                            else result,
-                        )
-                    )
-                except Exception as e:
-                    logger.error(f"Error executing tool {tool_call.get('name')}: {e}", exc_info=True)
-                    messages.append(
-                        ToolMessage(tool_call_id=tool_call["id"], content=f"Error: {str(e)}")
-                    )
-
-        return {"messages": messages}
+        return {"messages": HumanMessage(content=user_query),
+                "model":model,
+                "job":job}
     except Exception as e:
-        logger.error(f"Error in chat_node: {e}", exc_info=True)
-        return {"messages": state["messages"]}
+        logger.error(f"Error Starting the graph {e}",exc_info=True)
+        return {}
 
 
-@log_call()
+async def chat_node(state: State):
+    # 1. Setup Tools
+    tools = Tools + [t(user_id=state["user_id"]) for t in make_tools]
+    TOOL_REGISTRY = {t.name: t for t in tools}
+    tool_buffers = {}  
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0,streaming=True)
+    llm_with_tools = llm.bind_tools(tools)
+
+    context_list = list(state["messages"])
+    new_messages = []
+    final_text = ""
+    first_text= ""
+    messages_to_save = [state["messages"][-1]]
+    # 2. Iterate through stream (Triggering 'astream_events' in main.py)
+    async for chunk in llm_with_tools.astream(context_list):
+        # Accumulate text for the final state, but DO NOT yield it here.
+        # main.py's 'astream_events' will catch these chunks automatically.
+        if chunk.content:
+            first_text += chunk.content
+        # looking for toolcalls    
+        if chunk.tool_calls:
+            for tool_call in chunk.tool_calls:
+                tool_id = tool_call.get("id")
+                if not tool_id:
+                    continue  # skip partial calls
+
+                buf = tool_buffers.setdefault(
+                    tool_id,
+                    {"name": tool_call["name"], "args": {}}
+                )
+
+                buf["args"].update(tool_call.get("args", {}))
+
+    if tool_buffers:
+        # Build tool_calls list from tool_buffers
+        tool_calls_list = [
+            {
+                "id": tool_id,
+                "name": data["name"],
+                "args": data["args"],
+                "type": "function"
+            }
+            for tool_id, data in tool_buffers.items()
+        ]
+        
+        new_messages.append(AIMessage(
+            content=first_text,
+            tool_calls=tool_calls_list
+        ))
+
+        final_text += first_text
+        first_text = ""
+        tool_msg = None
+        for tool_id, data in tool_buffers.items():
+            tool = TOOL_REGISTRY.get(data["name"])
+            if not tool:
+                continue
+
+            try:
+                result = await tool.ainvoke(data["args"])
+                content_str = json.dumps(result, default=mongo_serializer)
+            except Exception as tool_err:
+                content_str = f"Error executing tool: {tool_err}"
+
+            tool_msg = ToolMessage(
+                tool_call_id=tool_id,
+                content=content_str,
+                name=data["name"]
+            )
+            new_messages.append(tool_msg)
+        if tool_msg:
+              async for chunk in llm_with_tools.astream(context_list + new_messages):
+                  if chunk.content:
+                    first_text += chunk.content
+
+    # 4. Finalize AI Message
+    if first_text:
+        ai_msg = AIMessage(content=first_text)
+        new_messages.append(ai_msg)
+    messages_to_save.append(AIMessage(content=final_text + first_text))
+
+    new_msgs = state["messages"] + new_messages
+    # 5. Persist 
+    try:
+        fn = make_add_messages(thread_id=state["thread_id"])
+        await fn(messages=messages_to_save)
+    except Exception as e:
+        logger.error(f"Error saving messages: {e}")
+
+    # 6. RETURN the state update 
+    return {"messages":new_msgs}
+
+
 async def memory_extract_node(state: State):
     """Extract memories from the last user message"""
     try:
         last_user_msg = last_message_of_type(state["messages"],HumanMessage).content
         if last_user_msg:
             last_user_msg = last_user_msg if isinstance(last_user_msg,str) else str(last_user_msg)
-            task = asyncio.create_task(memory_extractor(last_user_msg,state["user_id"]))
-            BACKGROUND_TASKS.add(task)
-            task.add_done_callback(BACKGROUND_TASKS.discard)
+            loop = asyncio.get_running_loop()
+            def _spawn_memory_task():
+                t = asyncio.create_task(
+                    memory_extractor(last_user_msg, state["user_id"])
+                )
+                BACKGROUND_TASKS.add(t)
+                t.add_done_callback(BACKGROUND_TASKS.discard)
+
+            loop.call_soon(_spawn_memory_task)
 
         return {}
     except Exception as e:
         logger.error(f"Error in memory_extract_node: {e}", exc_info=True)
         return {}
 
-@log_call()
 async def add_summary(state: State):
     # Schedule summarization (only once)
     if not state.get("summarizing") and state.get("total_tokens", 0) >= MAX_TOKENS:
@@ -484,6 +686,7 @@ async def add_summary(state: State):
                     new_messages.append(type(msg)(content=msg.content))
             snapshot = {
                 "user_id": state["user_id"],
+                "thread_id": state["thread_id"],
                 "messages":new_messages,
                 "total_tokens": state["total_tokens"],
                 "turn": state["turn"],
@@ -528,7 +731,7 @@ async def add_summary(state: State):
             new_state["messages"].extend(state["messages"][start_idx:])
             new_state["total_msg"] = len(new_state["messages"])
             new_state["total_tokens"] = count_tokens(
-                messages_to_text(new_state["messages"])
+                str([m.content for m in new_state["messages"]])
             )
             new_state["turn"] = state["turn"]
             new_state["summarizing"] = False
@@ -546,12 +749,10 @@ async def add_summary(state: State):
     return {}
 
 
-
-@log_call()
 async def update_num_tokens(state: State):
     try:
         # Use direct token counting instead of tool invocation
-        token_count = count_tokens(messages_to_text(state["messages"]))
+        token_count = count_tokens("\n".join(m.content for m in state["messages"] if m.content))
         return {
             "total_tokens": token_count,
             "turn": state["turn"] + 1,
@@ -564,7 +765,19 @@ async def update_num_tokens(state: State):
 
 # ---------------- GRAPH ---------------- #
 
-graph = StateGraph(State)
+graph = StateGraph(
+    State,
+    reducers={
+        "messages": operator.add,              # append messages
+        "turn": lambda _, new: new,             # overwrite
+        "total_tokens": lambda _, new: new,     # overwrite
+        "total_msg": lambda _, new: new,        # overwrite
+        "summarized_at_msg": lambda _, new: new,
+        "summarizing": lambda _, new: new,
+        "model": lambda _, new: new,
+        "job": lambda _, new: new,
+    },
+)
 graph.add_node("chat_node", chat_node)
 graph.add_node("memory_extract_node", memory_extract_node)
 graph.add_node("add_summary", add_summary)
